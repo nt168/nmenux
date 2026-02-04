@@ -403,8 +403,8 @@ static void term_handle_csi(TermView *t, const char *seq, int len) {
                 if (p1 == 1) {
                     t->app_cursor = (final == 'h');
                 }
-                /* alt screen: 清空即可（fzy/top/htop 会用） */
-                if (p1 == 1049 || p1 == 47) term_clear_all(t);
+                /* alt screen: 清空屏幕，但保持模式（DECCKM/keypad） */
+                if (p1 == 1049 || p1 == 47) term_clear_screenbuf_keep_modes(t);
             }
             break;
         default: break;
@@ -1024,4 +1024,3 @@ bool hot_handle_key(HotPopup *p, int ch) {
     }
     return true;
 }
-

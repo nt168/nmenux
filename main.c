@@ -1238,6 +1238,9 @@ static void run_tui(Ndx *ndx) {
          * Otherwise ncurses may keep stale internal geometry and the hot area
          * (especially ncurses apps like htop) will render garbled during drag-resize. */
         if (ch == KEY_RESIZE) {
+            int nh, nw;
+            getmaxyx(stdscr, nh, nw);
+            resizeterm(nh, nw);
             dirty = true;
             continue;
         }
