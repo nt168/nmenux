@@ -7,12 +7,12 @@ LDLIBS ?= -lncursesw
 
 all: perftui
 
-perftui: main.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDLIBS)
+perftui: main.c mterm.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ main.c mterm.c $(LDLIBS)
 
-# 仅用于验证解析/遍历逻辑(不依赖 ncurses 头文件)
-perftui_nocurses: main.c
-	$(CC) $(CFLAGS) -o $@ $<
+# 仅用于验证解析/遍历逻辑(当前仍依赖 ncurses 头文件)
+perftui_nocurses: main.c mterm.c
+	$(CC) $(CFLAGS) -o $@ main.c mterm.c
 
 clean:
 	rm -f perftui perftui_nocurses
