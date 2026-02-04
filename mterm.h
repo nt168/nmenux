@@ -34,8 +34,16 @@ typedef struct {
     bool    app_cursor;
     bool    app_keypad;
 
+    /* DECSTBM scroll region (inclusive). Ncurses apps (e.g. htop) rely on it,
+     * especially after resize where insert/delete-line is used in a region.
+     */
+    int     scroll_top;
+    int     scroll_bottom;
+
     int cx, cy;
     int saved_cx, saved_cy;
+    bool    wrap_pending; /* VT100 autowrap pending at last column */
+
 
     int esc_state;
     char esc_buf[128];
@@ -71,8 +79,8 @@ const char *node_view_name(const Node *n, char *buf, size_t bufsz);
 
 void hot_init(HotPopup *p);
 void hot_close(HotPopup *p);
-void hot_set_geom(HotPopup *p, int y, int x, int h, int w);
-void hot_pump(HotPopup *p);
+bool hot_set_geom(HotPopup *p, int y, int x, int h, int w);
+bool hot_pump(HotPopup *p);
 void hot_draw(HotPopup *p);
 bool hot_handle_key(HotPopup *p, int ch);
 

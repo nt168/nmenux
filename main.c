@@ -15,8 +15,12 @@
 #include <string.h>
 #include <wchar.h>
 #include <unistd.h>
+#include <time.h>
 #include "ndx.h"
 #include "mterm.h"
+
+/* Forward decl: used in run_tui() for frame pacing / resize coalescing. */
+static uint64_t now_ms(void);
 
 #ifdef __has_include
 #  if __has_include(<ncursesw/ncurses.h>)
@@ -363,7 +367,7 @@ static void apply_type(Ndx *ndx, const char *id_base, char typ) {
 }
 
 
-static void apply_x(Ndx *ndx, const char *id_base, char x) {
+static void __attribute__((unused)) apply_x(Ndx *ndx, const char *id_base, char x) {
     Node *n = (Node*)hmap_get(&ndx->by_base, id_base);
     if (!n) {
         fprintf(stderr, "warn: type config refers to missing node base id: %s\n", id_base);
@@ -1054,7 +1058,11 @@ static void draw_ui(UI *u) {
     mvadd_u8_fit(H - 1, 0, status, W);
     attroff(COLOR_PAIR(3));
 
-    refresh();
+    /* Batch curses screen updates with doupdate() in the main loop.
+     * Use wnoutrefresh(stdscr) instead of noutrefresh() to avoid
+     * environments where noutrefresh is only provided as a macro.
+     */
+    wnoutrefresh(stdscr);
 }
 
 static bool is_leaf_parent(Node *n) {
@@ -1159,12 +1167,59 @@ static void run_tui(Ndx *ndx) {
     hot_init(&pop);
     Node *hot_suppress = NULL;
 
+    bool force_redraw = false;
+    uint64_t last_hot_draw_ms = 0;
+    uint64_t last_hot_pump_ms = 0;
+
+    /* Hot-terminal render/pump pacing (ms). Lower FPS drastically reduces CPU
+     * for heavy ncurses apps like htop running inside our simple renderer. */
+    const uint64_t HOT_FRAME_MS = 100;      /* ~10 FPS */
+
+    /* Resize coalescing: during mouse-drag resize, KEY_RESIZE can fire in a
+     * tight loop and cause 90%+ CPU. We only apply the final size after the
+     * resize stream settles for a short window. */
+    const uint64_t RESIZE_SETTLE_MS = 120;
+    bool resize_pending = false;
+    int  pend_h = 0, pend_w = 0;
+    uint64_t last_resize_evt_ms = 0;
+
     while (1) {
+        /* If we are in the middle of a drag-resize burst, do minimal work and
+         * only keep collecting the latest geometry until it settles. */
+        if (resize_pending) {
+            uint64_t now = now_ms();
+            if (now - last_resize_evt_ms >= RESIZE_SETTLE_MS) {
+                resizeterm(pend_h, pend_w);
+                resize_pending = false;
+                dirty = true;
+                force_redraw = true;
+            } else {
+                /* During drag: avoid pumping/drawing the hot terminal and the
+                 * whole UI; just wait a bit and keep eating KEY_RESIZE. */
+                timeout(20);
+                int ch = getch();
+                if (ch == KEY_RESIZE) {
+                    getmaxyx(stdscr, pend_h, pend_w);
+                    last_resize_evt_ms = now_ms();
+                    continue;
+                }
+                if (ch != ERR) ungetch(ch);
+                continue;
+            }
+        }
+
+        bool base_rebuilt = false;
+        bool base_force = false;
+        bool hot_geom_changed = false;
+
+        bool need_redraw = dirty || force_redraw;
+
         if (dirty) {
             ui_rebuild(&u);
             /* ui_rebuild() 会把 u.col_count 设为“完整标题列数” */
             full_cols = u.col_count;
             dirty = false;
+            base_rebuilt = true;
         }
 
         /*
@@ -1177,8 +1232,6 @@ static void run_tui(Ndx *ndx) {
         if (visible_cols < u.focus_col + 1) visible_cols = u.focus_col + 1;
         u.col_count = visible_cols;
 
-        draw_ui(&u);
-
         /* a 类热点：光标停留在 x=='a' 的节点上时弹出，并允许在红框内运行 top */
         Node *cursor = ui_get_cursor_node(&u);
         if (hot_suppress && cursor != hot_suppress) hot_suppress = NULL;
@@ -1188,7 +1241,11 @@ static void run_tui(Ndx *ndx) {
         getmaxyx(stdscr, H, W);
 
         if (!want_hot) {
-            if (pop.active) hot_close(&pop);
+            if (pop.active) {
+                hot_close(&pop);
+                need_redraw = true;
+                base_force = true; /* erase old popup area */
+            }
         } else {
             if (!pop.active || pop.owner != cursor) {
                 hot_close(&pop);
@@ -1197,6 +1254,8 @@ static void run_tui(Ndx *ndx) {
                 pop.owner = cursor;
                 pop.closed_by_enter = false;
                 pop.last_owner = NULL;
+                need_redraw = true;
+                base_force = true;
             }
 
             int xs[MAX_COLS] = {0}, ws[MAX_COLS] = {0};
@@ -1216,10 +1275,49 @@ static void run_tui(Ndx *ndx) {
             if (ph > H - 3) ph = H - 3;
             int y = (H - 1) - ph;
 
-            hot_set_geom(&pop, y, x, ph, w);
+            hot_geom_changed = hot_set_geom(&pop, y, x, ph, w);
+            if (hot_geom_changed) {
+                need_redraw = true;
+                base_force = true; /* popup moved/resized: redraw base to clear old border */
+            }
 
-            hot_pump(&pop);
-            hot_draw(&pop);
+            bool do_pump = true;
+            if (pop.active && pop.mode == HOT_TERM) {
+                uint64_t now = now_ms();
+                if (now - last_hot_pump_ms < HOT_FRAME_MS) {
+                    do_pump = false;
+                } else {
+                    last_hot_pump_ms = now;
+                }
+            }
+            if (do_pump && hot_pump(&pop)) {
+                need_redraw = true;
+            }
+        }
+
+        if (need_redraw) {
+            bool did_draw = true;
+            if (pop.active && pop.mode == HOT_TERM) {
+                uint64_t now = now_ms();
+                if (now - last_hot_draw_ms < HOT_FRAME_MS) {
+                    did_draw = false;
+                } else {
+                    last_hot_draw_ms = now;
+                }
+            }
+            if (did_draw) {
+                /* Avoid redrawing the whole main UI for every frame while a
+                 * hot-terminal is running; usually only the popup changes. */
+                bool need_base = base_rebuilt || force_redraw || base_force || !(pop.active && pop.mode == HOT_TERM);
+                if (need_base) {
+                    draw_ui(&u);
+                }
+                if (pop.active) {
+                    hot_draw(&pop);
+                }
+                doupdate();
+                force_redraw = false;
+            }
         }
 
         if (pop.closed_by_enter) {
@@ -1228,7 +1326,7 @@ static void run_tui(Ndx *ndx) {
             pop.last_owner = NULL;
         }
 
-        if (pop.active && pop.mode == HOT_TERM) timeout(50);
+        if (pop.active && pop.mode == HOT_TERM) timeout((int)HOT_FRAME_MS);
         else timeout(-1);
 
         int ch = getch();
@@ -1238,15 +1336,27 @@ static void run_tui(Ndx *ndx) {
          * Otherwise ncurses may keep stale internal geometry and the hot area
          * (especially ncurses apps like htop) will render garbled during drag-resize. */
         if (ch == KEY_RESIZE) {
-            int nh, nw;
-            getmaxyx(stdscr, nh, nw);
-            resizeterm(nh, nw);
-            dirty = true;
+            getmaxyx(stdscr, pend_h, pend_w);
+            resize_pending = true;
+            last_resize_evt_ms = now_ms();
+
+            /* Drain a burst of resize events already queued, keeping only the
+             * latest size. If any non-resize key is encountered, push it back. */
+            timeout(0);
+            int c2;
+            while ((c2 = getch()) == KEY_RESIZE) {
+                getmaxyx(stdscr, pend_h, pend_w);
+                last_resize_evt_ms = now_ms();
+            }
+            if (c2 != ERR) ungetch(c2);
             continue;
         }
 
         if (pop.active) {
-            if (hot_handle_key(&pop, ch)) continue;
+            if (hot_handle_key(&pop, ch)) {
+                if (pop.mode == HOT_INPUT) force_redraw = true;
+                continue;
+            }
         }
 
         if (ch == 'q' || ch == 'Q' || ch == 27) break;
@@ -1310,6 +1420,7 @@ static void run_tui(Ndx *ndx) {
         } else if (changed_focus) {
             /* focus 变化不一定需要 rebuild，但需要重绘 */
             dirty = false;
+            force_redraw = true;
         }
     }
 
@@ -1353,4 +1464,9 @@ int main(int argc, char **argv)
     run_tui(&ndx);
     ndx_free(&ndx);
     return 0;
+}
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
 }
