@@ -1177,6 +1177,20 @@ static bool hot_spawn(HotPopup *p, const char *cmd) {
     return true;
 }
 
+bool hot_start_cmd(HotPopup *p, const char *cmd) {
+    if (!p || !cmd) return false;
+
+    /* 复制到 input，用于 fzy 检测与结果回填 */
+    size_t n = strlen(cmd);
+    if (n >= sizeof(p->input)) n = sizeof(p->input) - 1;
+    memcpy(p->input, cmd, n);
+    p->input[n] = 0;
+    p->in_len = (int)n;
+
+    return hot_spawn(p, p->input);
+}
+
+
 void hot_draw(HotPopup *p) {
     if (!p || !p->active || !p->wb || !p->wi) return;
     werase(p->wb);

@@ -80,6 +80,7 @@ const char *node_view_name(const Node *n, char *buf, size_t bufsz);
 void hot_init(HotPopup *p);
 void hot_close(HotPopup *p);
 bool hot_set_geom(HotPopup *p, int y, int x, int h, int w);
+bool hot_start_cmd(HotPopup *p, const char *cmd);
 bool hot_pump(HotPopup *p);
 void hot_draw(HotPopup *p);
 bool hot_handle_key(HotPopup *p, int ch);

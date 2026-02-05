@@ -43,6 +43,7 @@ struct Node {
       节点类型为"c"时，val值为"static"表示这个是强制默认就选中的	
       */
     char* val;
+    char* cmd;   /* 节点类型为"a"时，对应的热区运行的指令*/
 };
 
 #endif

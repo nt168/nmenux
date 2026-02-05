@@ -301,6 +301,10 @@ typedef struct { DimEnt *v; int n; int cap; } DimVec;
 typedef struct { char *idb; char typ; } TypeEnt;
 typedef struct { TypeEnt *v; int n; int cap; } TypeVec;
 
+/* hot cmd entries：收集后统一应用（热区运行） */
+typedef struct { char *idb; char *cmd; } HotEnt;
+typedef struct { HotEnt *v; int n; int cap; } HotVec;
+
 static void dimvec_push(DimVec *dv, const char *idb, int dim) {
     if (dv->n == dv->cap) {
         dv->cap = dv->cap ? dv->cap * 2 : 16;
@@ -337,6 +341,29 @@ static void typevec_free(TypeVec *tv) {
     tv->n = tv->cap = 0;
 }
 
+
+static void hotvec_push(HotVec *hv, const char *idb, const char *cmd) {
+    if (hv->n == hv->cap) {
+        hv->cap = hv->cap ? hv->cap * 2 : 16;
+        hv->v = (HotEnt*)realloc(hv->v, (size_t)hv->cap * sizeof(HotEnt));
+        if (!hv->v) { perror("realloc"); exit(1); }
+    }
+    hv->v[hv->n].idb = strdup(idb ? idb : "");
+    hv->v[hv->n].cmd = strdup(cmd ? cmd : "");
+    hv->n++;
+}
+
+static void hotvec_free(HotVec *hv) {
+    for (int i = 0; i < hv->n; i++) {
+        free(hv->v[i].idb);
+        free(hv->v[i].cmd);
+    }
+    free(hv->v);
+    hv->v = NULL;
+    hv->n = hv->cap = 0;
+}
+
+
 static char parse_type_token(const char *s) {
     if (!s) return 0;
     while (*s && isspace((unsigned char)*s)) s++;
@@ -367,6 +394,26 @@ static void apply_type(Ndx *ndx, const char *id_base, char typ) {
 }
 
 
+static bool apply_hotcmd(Ndx *ndx, const char *id_base, const char *cmd) {
+    Node *n = (Node*)hmap_get(&ndx->by_base, id_base);
+    if (!n) {
+        fprintf(stderr, "热区节点设置错误：%s 对应节点不存在\n", id_base);
+        return false;
+    }
+    if (n->x != 'a') {
+        fprintf(stderr, "热区节点设置错误：%s>%s 不是 a 类型节点（当前为 '%c'）\n",
+                n->id_raw, n->name, n->x ? n->x : '0');
+        return false;
+    }
+    free(n->cmd);
+    n->cmd = strdup(cmd ? cmd : "");
+    if (!n->cmd) { perror("strdup"); return false; }
+    return true;
+}
+
+
+
+
 static void __attribute__((unused)) apply_x(Ndx *ndx, const char *id_base, char x) {
     Node *n = (Node*)hmap_get(&ndx->by_base, id_base);
     if (!n) {
@@ -394,6 +441,7 @@ static void ndx_free(Ndx *ndx) {
         free(n->id_base);
         free(n->name);
         free(n->val);
+        free(n->cmd);
         if (n->col_titles) {
             for (int k = 0; k < n->col_title_count; k++) free(n->col_titles[k]);
             free(n->col_titles);
@@ -418,6 +466,8 @@ static bool ndx_parse_file(Ndx *ndx, const char *path) {
 
     DimVec dims = {0};
     TypeVec types = {0};
+    HotVec hotcmds = {0};
+    bool ok = true;
 
     char *line;
     while ((line = read_line(fp)) != NULL) {
@@ -436,12 +486,29 @@ static bool ndx_parse_file(Ndx *ndx, const char *path) {
             continue;
         }
 
-        /* dim / type 行：不依赖标题，看到 "1.2.3:2"/"1.2.3:di2" 或 "1.2.3:a" 就认 */
+        /* dim / type / hotcmd 行：不依赖标题，看到 "1.2.3:2"/"1.2.3:di2" 或 "1.2.3:a" 或 "1.2.3:[cmd]" 就认 */
         if (looks_like_dim_line(s)) {
             char *colon = strchr(s, ':');
             *colon = 0;
             char *idb = str_trim(s);
             char *rhs = str_trim(colon + 1);
+
+            /* 热区运行：1.2.1:[find ... | fzy] */
+            if (rhs[0] == '[') {
+                char *lb = strchr(rhs, '[');
+                char *rb = strrchr(rhs, ']');
+                if (!lb || !rb || rb <= lb) {
+                    fprintf(stderr, "config error: 热区运行格式错误：%s:[...]\n", idb);
+                    ok = false;
+                    free(line);
+                    break;
+                }
+                *rb = 0;
+                char *cmd = str_trim(lb + 1);
+                hotvec_push(&hotcmds, idb, cmd);
+                free(line);
+                continue;
+            }
 
             int dim = parse_dim_token(rhs);
             if (dim == 2 || dim == 3) {
@@ -503,6 +570,13 @@ static bool ndx_parse_file(Ndx *ndx, const char *path) {
 
     fclose(fp);
 
+    if (!ok) {
+        dimvec_free(&dims);
+        typevec_free(&types);
+        hotvec_free(&hotcmds);
+        return false;
+    }
+
     /* 绑定 title */
     for (int i = 0; i < ndx->all.n; i++) {
         Node *n = ndx->all.v[i];
@@ -511,12 +585,21 @@ static bool ndx_parse_file(Ndx *ndx, const char *path) {
         if (t) n->title = t;
     }
 
-    /* 统一应用 dim/type 配置 */
+    /* 统一应用 dim/type/hotcmd 配置 */
     for (int i = 0; i < dims.n; i++) apply_dim(ndx, dims.v[i].idb, dims.v[i].dim);
     for (int i = 0; i < types.n; i++) apply_type(ndx, types.v[i].idb, types.v[i].typ);
+
+    for (int i = 0; i < hotcmds.n; i++) {
+        if (!apply_hotcmd(ndx, hotcmds.v[i].idb, hotcmds.v[i].cmd)) {
+            ok = false;
+            break;
+        }
+    }
+
     dimvec_free(&dims);
     typevec_free(&types);
-    return true;
+    hotvec_free(&hotcmds);
+    return ok;
 }
 
 /* =========================
@@ -1211,6 +1294,7 @@ static void run_tui(Ndx *ndx) {
         bool base_rebuilt = false;
         bool base_force = false;
         bool hot_geom_changed = false;
+        bool hot_autorun = false;
 
         bool need_redraw = dirty || force_redraw;
 
@@ -1256,6 +1340,8 @@ static void run_tui(Ndx *ndx) {
                 pop.last_owner = NULL;
                 need_redraw = true;
                 base_force = true;
+
+                if (cursor && cursor->cmd && cursor->cmd[0]) hot_autorun = true;
             }
 
             int xs[MAX_COLS] = {0}, ws[MAX_COLS] = {0};
@@ -1279,6 +1365,13 @@ static void run_tui(Ndx *ndx) {
             if (hot_geom_changed) {
                 need_redraw = true;
                 base_force = true; /* popup moved/resized: redraw base to clear old border */
+            }
+
+            /* a 类型节点：如果配置了 cmd，则光标选中时自动运行该 cmd */
+            if (hot_autorun && pop.active && pop.mode == HOT_INPUT && cursor && cursor->cmd && cursor->cmd[0]) {
+                if (hot_start_cmd(&pop, cursor->cmd)) {
+                    need_redraw = true;
+                }
             }
 
             bool do_pump = true;
